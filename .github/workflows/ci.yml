@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test and analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.x
+          check-latest: true
+          cache: true
+      - name: Formatting
+        run: make fmt-check
+      - name: Workflow syntax
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          make workflow-lint
+      - name: Vet
+        run: make vet
+      - name: Unit tests and coverage
+        run: make coverage
+      - name: Race detector
+        run: make race
+      - name: Staticcheck
+        uses: dominikh/staticcheck-action@v1.4.0
+        with:
+          version: latest
+          install-go: false
+          cache-key: go1.26
+      - name: Vulnerability scan
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: 1.26.x
+          go-package: ./...
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/coverage.out
+          if-no-files-found: error
+
+  build:
+    name: Cross-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.x
+          check-latest: true
+          cache: true
+      - name: Build distribution
+        run: make dist
+      - name: Verify checksums
+        run: cd dist && sha256sum -c SHA256SUMS
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-link-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error

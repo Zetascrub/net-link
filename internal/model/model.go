@@ -6,7 +6,11 @@ import (
 	"time"
 )
 
-const Version = "0.1.0-dev"
+var (
+	Version     = "0.2.1-dev"
+	BuildCommit = "unknown"
+	BuildDate   = "unknown"
+)
 
 // Duration wraps time.Duration with human-readable JSON serialization ("142ms").
 type Duration time.Duration
@@ -51,10 +55,12 @@ type Run struct {
 }
 
 type Node struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Version   string   `json:"version"`
-	Addresses []string `json:"addresses,omitempty"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Version     string   `json:"version"`
+	Addresses   []string `json:"addresses,omitempty"`
+	BuildCommit string   `json:"build_commit,omitempty"`
+	BuildDate   string   `json:"build_date,omitempty"`
 }
 
 type Target struct {
@@ -92,6 +98,7 @@ type Summary struct {
 	Reachable   int `json:"reachable"`
 	Refused     int `json:"refused"`
 	TimedOut    int `json:"timed_out"`
+	Canceled    int `json:"canceled"`
 	Blocked     int `json:"blocked"`
 	Unsupported int `json:"unsupported"`
 	Denied      int `json:"permission_denied"`
@@ -102,6 +109,7 @@ const (
 	StateReachable        = "reachable"
 	StateRefused          = "refused"
 	StateTimedOut         = "timed_out"
+	StateCanceled         = "canceled"
 	StateBlocked          = "blocked"
 	StateUnsupported      = "unsupported"
 	StatePermissionDenied = "permission_denied"

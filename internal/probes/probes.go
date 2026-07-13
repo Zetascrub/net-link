@@ -17,7 +17,10 @@ type Probe interface {
 
 // ClassifyConnectError maps a dial/connect error to a model state string.
 func ClassifyConnectError(err error) string {
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, os.ErrDeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
+		return model.StateCanceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 		return model.StateTimedOut
 	}
 

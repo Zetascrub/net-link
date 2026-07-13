@@ -2,7 +2,9 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/Zetascrub/net-link/internal/model"
 )
@@ -20,7 +22,39 @@ func WriteJSON(path string, value any) error {
 		_, err = os.Stdout.Write(append(data, '\n'))
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0644)
+	return writeFileAtomic(path, append(data, '\n'))
+}
+
+func writeFileAtomic(path string, data []byte) (err error) {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".net-link-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer func() {
+		temp.Close()
+		if err != nil {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	if err = temp.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err = temp.Write(data); err != nil {
+		return err
+	}
+	if err = temp.Sync(); err != nil {
+		return err
+	}
+	if err = temp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("replace evidence file: %w", err)
+	}
+	return nil
 }
 
 func ReadRun(path string) (model.Run, error) {

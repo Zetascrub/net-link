@@ -1,6 +1,7 @@
 package targets
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -16,14 +17,15 @@ func FromHost(host string, ports []int, allowPublic bool) ([]model.Target, error
 	if host == "" {
 		return nil, fmt.Errorf("target host is required")
 	}
-	if err := policy.CheckHostAllowed(host, allowPublic); err != nil {
+	hosts, err := policy.ResolveHostAllowed(context.Background(), host, allowPublic)
+	if err != nil {
 		return nil, err
 	}
 	if len(ports) == 0 {
 		ports = commonPorts
 	}
 
-	return fromHosts([]string{host}, ports, model.SourceManual), nil
+	return fromHosts(hosts, ports, model.SourceManual), nil
 }
 
 func fromHosts(hosts []string, ports []int, sourceType string) []model.Target {

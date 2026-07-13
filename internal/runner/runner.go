@@ -24,9 +24,11 @@ func Run(ctx context.Context, opts Options, targets []model.Target) model.Run {
 	started := time.Now().UTC()
 	runID := ids.New("run")
 	node := model.Node{
-		ID:      model.DefaultLocalNodeID,
-		Name:    hostname(),
-		Version: model.Version,
+		ID:          model.DefaultLocalNodeID,
+		Name:        hostname(),
+		Version:     model.Version,
+		BuildCommit: model.BuildCommit,
+		BuildDate:   model.BuildDate,
 	}
 
 	probe := opts.Probe
@@ -49,20 +51,33 @@ func Run(ctx context.Context, opts Options, targets []model.Target) model.Run {
 		go func() {
 			defer wg.Done()
 			for target := range workCh {
+				var result model.Result
 				if strings.ToLower(target.Protocol) != model.ProtocolTCP {
-					resultCh <- unsupported(runID, node.ID, target)
-					continue
+					result = unsupported(runID, node.ID, target)
+				} else {
+					result = probe.Run(ctx, runID, node.ID, target)
 				}
-				resultCh <- probe.Run(ctx, runID, node.ID, target)
+				select {
+				case resultCh <- result:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
 	}
 
 	go func() {
+		defer close(workCh)
 		for _, target := range targets {
-			workCh <- target
+			select {
+			case workCh <- target:
+			case <-ctx.Done():
+				return
+			}
 		}
-		close(workCh)
+	}()
+
+	go func() {
 		wg.Wait()
 		close(resultCh)
 	}()
@@ -112,6 +127,8 @@ func summarize(results []model.Result, targetCount int) model.Summary {
 			summary.Refused++
 		case model.StateTimedOut:
 			summary.TimedOut++
+		case model.StateCanceled:
+			summary.Canceled++
 		case model.StateBlocked:
 			summary.Blocked++
 		case model.StateUnsupported:

@@ -20,21 +20,29 @@ import (
 	"github.com/Zetascrub/net-link/internal/targets"
 )
 
+const (
+	maxConcurrency = 1024
+	maxTimeout     = 10 * time.Minute
+)
+
 func Run(args []string) int {
 	if len(args) == 0 {
 		printUsage()
 		return 2
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	switch args[0] {
 	case "test":
-		return runTest(args[1:])
+		return runTest(ctx, args[1:])
 	case "discover":
-		return runDiscover(args[1:])
+		return runDiscover(ctx, args[1:])
 	case "link":
-		return runLink(args[1:])
+		return runLink(ctx, args[1:])
 	case "scan":
-		return runScan(args[1:])
+		return runScan(ctx, args[1:])
 	case "report":
 		return runReport(args[1:])
 	case "version":
@@ -50,7 +58,7 @@ func Run(args []string) int {
 	}
 }
 
-func runLink(args []string) int {
+func runLink(ctx context.Context, args []string) int {
 	if len(args) == 0 {
 		printLinkUsage()
 		return 2
@@ -58,11 +66,11 @@ func runLink(args []string) int {
 
 	switch args[0] {
 	case "listen":
-		return runLinkListen(args[1:])
+		return runLinkListen(ctx, args[1:])
 	case "discover":
-		return runLinkDiscover(args[1:])
+		return runLinkDiscover(ctx, args[1:])
 	case "matrix":
-		return runLinkMatrix(args[1:])
+		return runLinkMatrix(ctx, args[1:])
 	case "help", "-h", "--help":
 		printLinkUsage()
 		return 0
@@ -73,38 +81,57 @@ func runLink(args []string) int {
 	}
 }
 
-func runLinkListen(args []string) int {
-	args = reorderFlags(args, nil, map[string]bool{
+func runLinkListen(ctx context.Context, args []string) int {
+	args = reorderFlags(args, map[string]bool{
+		"allow-remote-checks": true,
+	}, map[string]bool{
 		"name":           true,
+		"bind-address":   true,
 		"discovery-port": true,
 		"link-port":      true,
+		"remote-scope":   true,
+		"remote-ports":   true,
 	})
 	fs := flag.NewFlagSet("link listen", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	name := fs.String("name", "", "peer name")
+	bindAddress := fs.String("bind-address", "0.0.0.0", "IPv4 address on which to listen")
 	discoveryPort := fs.Int("discovery-port", link.DefaultDiscoveryPort, "UDP discovery port")
 	linkPort := fs.Int("link-port", link.DefaultLinkPort, "TCP link verification port")
+	allowRemoteChecks := fs.Bool("allow-remote-checks", false, "allow unauthenticated peers to request service checks (unsafe)")
+	remoteScope := fs.String("remote-scope", "", "comma-separated internal CIDRs allowed for remote checks")
+	remotePortsInput := fs.String("remote-ports", "", "ports allowed for remote checks")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "usage: net-link link listen [--name pager]")
+		fmt.Fprintln(os.Stderr, "usage: net-link link listen [--name pager] [--bind-address 192.168.1.10] [--allow-remote-checks]")
 		return 2
 	}
+	if err := validateLinkOptions(*discoveryPort, *linkPort, time.Second); err != nil {
+		return fail(err)
+	}
+	remotePorts, err := targets.ParsePorts(*remotePortsInput)
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Fprintln(os.Stderr, "WARNING: link mode is experimental and unauthenticated; use only on networks you control.")
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	if err := link.Listen(ctx, link.ListenOptions{
-		Name:          *name,
-		DiscoveryPort: *discoveryPort,
-		LinkPort:      *linkPort,
+		Name:              *name,
+		BindAddress:       *bindAddress,
+		DiscoveryPort:     *discoveryPort,
+		LinkPort:          *linkPort,
+		AllowRemoteChecks: *allowRemoteChecks,
+		RemoteScopes:      splitScopes(*remoteScope),
+		RemotePorts:       remotePorts,
 	}, os.Stdout); err != nil && ctx.Err() == nil {
 		return fail(err)
 	}
 	return 0
 }
 
-func runLinkDiscover(args []string) int {
+func runLinkDiscover(ctx context.Context, args []string) int {
 	args = reorderFlags(args, map[string]bool{
 		"json": true,
 	}, map[string]bool{
@@ -113,6 +140,8 @@ func runLinkDiscover(args []string) int {
 		"link-port":      true,
 		"timeout":        true,
 		"out":            true,
+		"remote-scope":   true,
+		"remote-ports":   true,
 	})
 	fs := flag.NewFlagSet("link discover", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -129,6 +158,9 @@ func runLinkDiscover(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: net-link link discover")
 		return 2
 	}
+	if err := validateLinkOptions(*discoveryPort, *linkPort, *timeoutInput); err != nil {
+		return fail(err)
+	}
 
 	started := time.Now().UTC()
 	opts := link.DiscoverOptions{
@@ -137,7 +169,7 @@ func runLinkDiscover(args []string) int {
 		LinkPort:      *linkPort,
 		Timeout:       *timeoutInput,
 	}
-	links, err := link.Discover(context.Background(), opts)
+	links, err := link.Discover(ctx, opts)
 	if err != nil {
 		return fail(err)
 	}
@@ -153,9 +185,10 @@ func runLinkDiscover(args []string) int {
 	return 0
 }
 
-func runLinkMatrix(args []string) int {
+func runLinkMatrix(ctx context.Context, args []string) int {
 	args = reorderFlags(args, map[string]bool{
-		"json": true,
+		"json":                true,
+		"allow-remote-checks": true,
 	}, map[string]bool{
 		"name":           true,
 		"discovery-port": true,
@@ -173,6 +206,9 @@ func runLinkMatrix(args []string) int {
 	portsInput := fs.String("ports", "22,80,443,47889", "comma-separated ports or ranges")
 	out := fs.String("out", "", "write full JSON matrix evidence to this path")
 	jsonOut := fs.Bool("json", false, "print full JSON matrix evidence to stdout")
+	allowRemoteChecks := fs.Bool("allow-remote-checks", false, "allow unauthenticated peers to request checks from this temporary responder (unsafe)")
+	remoteScope := fs.String("remote-scope", "", "comma-separated internal CIDRs allowed for remote checks")
+	remotePortsInput := fs.String("remote-ports", "", "ports allowed for remote checks")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -180,20 +216,30 @@ func runLinkMatrix(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: net-link link matrix [--ports 22,80,443,47889]")
 		return 2
 	}
+	if err := validateLinkOptions(*discoveryPort, *linkPort, *timeoutInput); err != nil {
+		return fail(err)
+	}
 
 	ports, err := targets.ParsePorts(*portsInput)
 	if err != nil {
 		return fail(err)
 	}
+	remotePorts, err := targets.ParsePorts(*remotePortsInput)
+	if err != nil {
+		return fail(err)
+	}
 	started := time.Now().UTC()
 	opts := link.MatrixOptions{
-		Name:          *name,
-		DiscoveryPort: *discoveryPort,
-		LinkPort:      *linkPort,
-		Timeout:       *timeoutInput,
-		Ports:         ports,
+		Name:              *name,
+		DiscoveryPort:     *discoveryPort,
+		LinkPort:          *linkPort,
+		Timeout:           *timeoutInput,
+		Ports:             ports,
+		AllowRemoteChecks: *allowRemoteChecks,
+		RemoteScopes:      splitScopes(*remoteScope),
+		RemotePorts:       remotePorts,
 	}
-	matrices, err := link.Matrix(context.Background(), opts)
+	matrices, err := link.Matrix(ctx, opts)
 	if err != nil {
 		return fail(err)
 	}
@@ -209,28 +255,38 @@ func runLinkMatrix(args []string) int {
 	return 0
 }
 
-func runDiscover(args []string) int {
+func runDiscover(ctx context.Context, args []string) int {
 	args = reorderFlags(args, map[string]bool{
-		"allow-public": true,
-		"json":         true,
-		"dry-run":      true,
+		"allow-public":   true,
+		"json":           true,
+		"dry-run":        true,
+		"auto":           true,
+		"include-routes": true,
 	}, map[string]bool{
-		"scope":       true,
-		"ports":       true,
-		"out":         true,
-		"timeout":     true,
-		"concurrency": true,
-		"max-hosts":   true,
+		"scope":             true,
+		"ports":             true,
+		"out":               true,
+		"timeout":           true,
+		"concurrency":       true,
+		"max-hosts":         true,
+		"max-total-hosts":   true,
+		"interface":         true,
+		"exclude-interface": true,
 	})
 	fs := flag.NewFlagSet("discover", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	scope := fs.String("scope", "", "comma-separated IPv4 CIDR scopes; defaults to local private networks")
+	auto := fs.Bool("auto", false, "automatically discover private scopes from active interfaces")
+	includeRoutes := fs.Bool("include-routes", false, "include private non-default routes (requires --auto)")
+	interfaces := fs.String("interface", "", "comma-separated interfaces to include in auto discovery")
+	excludeInterfaces := fs.String("exclude-interface", "", "comma-separated interfaces to exclude")
 	portsInput := fs.String("ports", "22,80,443,8080,8443", "comma-separated ports or ranges")
 	out := fs.String("out", "", "write full JSON results to this path")
 	jsonOut := fs.Bool("json", false, "print full JSON results to stdout")
 	timeoutInput := fs.Duration("timeout", 500*time.Millisecond, "TCP connect timeout")
 	concurrency := fs.Int("concurrency", 256, "maximum concurrent probes")
 	maxHosts := fs.Int("max-hosts", 1024, "maximum addresses allowed per CIDR scope")
+	maxTotalHosts := fs.Int("max-total-hosts", 4096, "maximum unique addresses across automatic scopes")
 	allowPublic := fs.Bool("allow-public", false, "allow public IP targets")
 	dryRun := fs.Bool("dry-run", false, "print scope and target count without running probes")
 	if err := fs.Parse(args); err != nil {
@@ -239,6 +295,15 @@ func runDiscover(args []string) int {
 	if fs.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "usage: net-link discover [--scope 192.168.1.0/24] [--ports 22,80,443]")
 		return 2
+	}
+	if *auto && strings.TrimSpace(*scope) != "" {
+		return fail(fmt.Errorf("--auto and --scope cannot be used together"))
+	}
+	if *includeRoutes && !*auto {
+		return fail(fmt.Errorf("--include-routes requires --auto"))
+	}
+	if err := validateProbeOptions(*timeoutInput, *concurrency); err != nil {
+		return fail(err)
 	}
 
 	ports, err := targets.ParsePorts(*portsInput)
@@ -249,7 +314,22 @@ func runDiscover(args []string) int {
 	var targetList []model.Target
 	var scopes []string
 	if strings.TrimSpace(*scope) == "" {
-		targetList, scopes, err = targets.FromLocalNetworks(ports, *maxHosts)
+		if *auto {
+			scopes, err = targets.AutoPrivateIPv4Networks(targets.AutoNetworkOptions{
+				IncludeInterfaces: splitScopes(*interfaces),
+				ExcludeInterfaces: splitScopes(*excludeInterfaces),
+				ExcludeVirtual:    true,
+				IncludeRoutes:     *includeRoutes,
+			})
+			if err == nil && len(scopes) == 0 {
+				err = fmt.Errorf("automatic discovery found no private IPv4 networks")
+			}
+			if err == nil {
+				targetList, err = targets.FromNetworks(scopes, ports, *maxHosts, *maxTotalHosts)
+			}
+		} else {
+			targetList, scopes, err = targets.FromLocalNetworks(ports, *maxHosts)
+		}
 	} else {
 		scopes = splitScopes(*scope)
 		targetList, err = targets.FromCIDRList(*scope, ports, *maxHosts, *allowPublic)
@@ -262,6 +342,10 @@ func runDiscover(args []string) int {
 	}
 
 	if *dryRun {
+		if *auto {
+			fmt.Fprintf(os.Stderr, "Automatic scope discovery: interfaces=%s excluded=%s routes=%t\n",
+				valueOrDefault(*interfaces, "active physical"), valueOrDefault(*excludeInterfaces, "virtual defaults"), *includeRoutes)
+		}
 		fmt.Fprintf(os.Stderr, "Dry run: %d scope(s), %d target(s), %d port(s)\n",
 			len(scopes), len(targetList), len(ports))
 		fmt.Fprintf(os.Stderr, "Scopes: %s\n", strings.Join(scopes, ", "))
@@ -270,7 +354,7 @@ func runDiscover(args []string) int {
 	}
 
 	fmt.Fprintf(os.Stderr, "Discovery scopes: %s\n", strings.Join(scopes, ", "))
-	run := runner.Run(context.Background(), runner.Options{
+	run := runner.Run(ctx, runner.Options{
 		Command:     "discover " + strings.Join(args, " "),
 		Timeout:     *timeoutInput,
 		Concurrency: *concurrency,
@@ -283,7 +367,14 @@ func runDiscover(args []string) int {
 	return 0
 }
 
-func runTest(args []string) int {
+func valueOrDefault(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func runTest(ctx context.Context, args []string) int {
 	args = reorderFlags(args, map[string]bool{
 		"allow-public": true,
 		"json":         true,
@@ -307,6 +398,9 @@ func runTest(args []string) int {
 	dryRun := fs.Bool("dry-run", false, "print targets without running probes")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if err := validateProbeOptions(*timeoutInput, *concurrency); err != nil {
+		return fail(err)
 	}
 
 	ports, err := targets.ParsePorts(*portsInput)
@@ -339,7 +433,7 @@ func runTest(args []string) int {
 		return 0
 	}
 
-	run := runner.Run(context.Background(), runner.Options{
+	run := runner.Run(ctx, runner.Options{
 		Command:     "test " + strings.Join(args, " "),
 		Timeout:     *timeoutInput,
 		Concurrency: *concurrency,
@@ -352,7 +446,7 @@ func runTest(args []string) int {
 	return 0
 }
 
-func runScan(args []string) int {
+func runScan(ctx context.Context, args []string) int {
 	args = reorderFlags(args, map[string]bool{
 		"allow-public": true,
 		"json":         true,
@@ -381,6 +475,9 @@ func runScan(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: net-link scan <target-or-cidr> [--scanner nmap]")
 		return 2
 	}
+	if err := validateProbeOptions(*timeoutInput, *concurrency); err != nil {
+		return fail(err)
+	}
 	if *scannerName != "nmap" {
 		return fail(fmt.Errorf("scanner %q is not implemented yet", *scannerName))
 	}
@@ -398,7 +495,7 @@ func runScan(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	targetList, err := scanner.RunNmap(context.Background(), fs.Arg(0), ports, *allowPublic)
+	targetList, err := scanner.RunNmap(ctx, fs.Arg(0), ports, *allowPublic)
 	if err != nil {
 		return fail(err)
 	}
@@ -406,7 +503,7 @@ func runScan(args []string) int {
 		return fail(fmt.Errorf("nmap found no open tcp targets"))
 	}
 
-	run := runner.Run(context.Background(), runner.Options{
+	run := runner.Run(ctx, runner.Options{
 		Command:     "scan " + strings.Join(args, " "),
 		Timeout:     *timeoutInput,
 		Concurrency: *concurrency,
@@ -450,11 +547,12 @@ func runReport(args []string) int {
 
 func printSummary(run model.Run) {
 	fmt.Fprintf(os.Stderr, "Net-Link run %s\n", run.ID)
-	fmt.Fprintf(os.Stderr, "Targets: %d  Reachable: %d  Refused: %d  Timed out: %d  Blocked: %d  Denied: %d  Errors: %d\n",
+	fmt.Fprintf(os.Stderr, "Targets: %d  Reachable: %d  Refused: %d  Timed out: %d  Canceled: %d  Blocked: %d  Denied: %d  Errors: %d\n",
 		run.Summary.Targets,
 		run.Summary.Reachable,
 		run.Summary.Refused,
 		run.Summary.TimedOut,
+		run.Summary.Canceled,
 		run.Summary.Blocked,
 		run.Summary.Denied,
 		run.Summary.Errors,
@@ -517,6 +615,7 @@ Usage:
   net-link link discover [--out links.nljson]
   net-link link matrix [--ports 22,80,443,47889] [--out matrix.nljson]
   net-link discover [--scope 192.168.1.0/24] [--ports 22,80,443]
+  net-link discover --auto [--include-routes] [--interface eth0]
   net-link test <target> [--ports 22,80,443]
   net-link test --nmap scan.xml
   net-link scan <target-or-cidr> --scanner nmap
@@ -530,17 +629,27 @@ Output:
 Safety:
   Public IP targets are blocked by default. Use --allow-public to override.
   Use --dry-run on any command to preview targets without executing probes.
+  Link mode is experimental and unauthenticated. Remote checks are disabled by
+  default; --allow-remote-checks is an unsafe opt-in for controlled networks.
 
 `)
 }
 
 func printLinkUsage() {
-	fmt.Fprint(os.Stderr, `net-link peer mode discovers and verifies other Net-Link instances.
+	fmt.Fprint(os.Stderr, `net-link peer mode is EXPERIMENTAL and discovers other Net-Link instances.
+
+The protocol is unauthenticated. Remote service checks are disabled by default.
+Enabling them also requires explicit --remote-scope and --remote-ports policy.
+Only use these options on networks you control.
 
 Usage:
-  net-link link listen [--name pager]
+  net-link link listen [--name pager] [--bind-address 192.168.1.10]
+                       [--allow-remote-checks --remote-scope 192.168.1.0/24
+                        --remote-ports 22,80,443]
   net-link link discover [--out links.nljson]
   net-link link matrix [--ports 22,80,443,47889] [--out matrix.nljson]
+                       [--allow-remote-checks --remote-scope 192.168.1.0/24
+                        --remote-ports 22,80,443]
 
 `)
 }
@@ -647,6 +756,29 @@ func splitScopes(input string) []string {
 		}
 	}
 	return scopes
+}
+
+func validateProbeOptions(timeout time.Duration, concurrency int) error {
+	if timeout <= 0 || timeout > maxTimeout {
+		return fmt.Errorf("timeout must be greater than zero and at most %s", maxTimeout)
+	}
+	if concurrency < 1 || concurrency > maxConcurrency {
+		return fmt.Errorf("concurrency must be between 1 and %d", maxConcurrency)
+	}
+	return nil
+}
+
+func validateLinkOptions(discoveryPort, linkPort int, timeout time.Duration) error {
+	if discoveryPort < 1 || discoveryPort > 65535 {
+		return fmt.Errorf("discovery port must be between 1 and 65535")
+	}
+	if linkPort < 1 || linkPort > 65535 {
+		return fmt.Errorf("link port must be between 1 and 65535")
+	}
+	if timeout <= 0 || timeout > maxTimeout {
+		return fmt.Errorf("timeout must be greater than zero and at most %s", maxTimeout)
+	}
+	return nil
 }
 
 func reorderFlags(args []string, boolFlags map[string]bool, valueFlags map[string]bool) []string {

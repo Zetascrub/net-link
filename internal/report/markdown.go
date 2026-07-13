@@ -55,13 +55,14 @@ func WriteMarkdown(path string, run model.Run) error {
 
 	// --- Summary table ---
 	fmt.Fprintf(w, "## Summary\n\n")
-	fmt.Fprintf(w, "| Targets | Reachable | Refused | Timed Out | Blocked | Denied | Errors |\n")
-	fmt.Fprintf(w, "| --- | --- | --- | --- | --- | --- | --- |\n")
-	fmt.Fprintf(w, "| %d | %d | %d | %d | %d | %d | %d |\n\n",
+	fmt.Fprintf(w, "| Targets | Reachable | Refused | Timed Out | Canceled | Blocked | Denied | Errors |\n")
+	fmt.Fprintf(w, "| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+	fmt.Fprintf(w, "| %d | %d | %d | %d | %d | %d | %d | %d |\n\n",
 		run.Summary.Targets,
 		run.Summary.Reachable,
 		run.Summary.Refused,
 		run.Summary.TimedOut,
+		run.Summary.Canceled,
 		run.Summary.Blocked,
 		run.Summary.Denied,
 		run.Summary.Errors,

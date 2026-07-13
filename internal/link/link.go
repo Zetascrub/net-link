@@ -3,6 +3,11 @@ package link
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +22,7 @@ import (
 
 	"github.com/Zetascrub/net-link/internal/ids"
 	"github.com/Zetascrub/net-link/internal/model"
+	"github.com/Zetascrub/net-link/internal/policy"
 	"github.com/Zetascrub/net-link/internal/probes"
 )
 
@@ -31,6 +37,11 @@ const (
 	serviceMessageType   = "service_check"
 	serviceResultType    = "service_result"
 	legacyLinkProbeLine  = "NET-LINK HELLO/1\n"
+	maxWireMessageBytes  = 64 * 1024
+	maxServiceTargets    = 256
+	maxServiceWorkers    = 64
+	maxConcurrentClients = 32
+	maxServiceDuration   = 15 * time.Second
 )
 
 type Peer struct {
@@ -40,17 +51,20 @@ type Peer struct {
 	Addresses     []string `json:"addresses"`
 	DiscoveryPort int      `json:"discovery_port"`
 	LinkPort      int      `json:"link_port"`
+	PublicKey     string   `json:"public_key,omitempty"`
+	BuildCommit   string   `json:"build_commit,omitempty"`
+	BuildDate     string   `json:"build_date,omitempty"`
 }
 
 type Link struct {
-	Peer          Peer         `json:"peer"`
-	Address       string       `json:"address"`
+	Peer          Peer           `json:"peer"`
+	Address       string         `json:"address"`
 	Duration      model.Duration `json:"duration"`
-	Discovered    time.Time    `json:"discovered_at"`
-	Linked        bool         `json:"linked"`
-	ReverseLinked bool         `json:"reverse_linked"`
-	Error         string       `json:"error,omitempty"`
-	ReverseError  string       `json:"reverse_error,omitempty"`
+	Discovered    time.Time      `json:"discovered_at"`
+	Linked        bool           `json:"linked"`
+	ReverseLinked bool           `json:"reverse_linked"`
+	Error         string         `json:"error,omitempty"`
+	ReverseError  string         `json:"reverse_error,omitempty"`
 }
 
 type ServiceTarget struct {
@@ -112,9 +126,13 @@ type MatrixSummary struct {
 }
 
 type ListenOptions struct {
-	Name          string
-	DiscoveryPort int
-	LinkPort      int
+	Name              string
+	BindAddress       string
+	DiscoveryPort     int
+	LinkPort          int
+	AllowRemoteChecks bool
+	RemoteScopes      []string
+	RemotePorts       []int
 }
 
 type DiscoverOptions struct {
@@ -125,11 +143,82 @@ type DiscoverOptions struct {
 }
 
 type MatrixOptions struct {
-	Name          string
-	DiscoveryPort int
-	LinkPort      int
-	Timeout       time.Duration
-	Ports         []int
+	Name              string
+	DiscoveryPort     int
+	LinkPort          int
+	Timeout           time.Duration
+	Ports             []int
+	AllowRemoteChecks bool
+	RemoteScopes      []string
+	RemotePorts       []int
+}
+
+type servicePolicy struct {
+	enabled  bool
+	networks []*net.IPNet
+	ports    map[int]bool
+}
+
+func newServicePolicy(enabled bool, scopes []string, ports []int) (servicePolicy, error) {
+	result := servicePolicy{enabled: enabled, ports: map[int]bool{}}
+	if !enabled {
+		return result, nil
+	}
+	if len(scopes) == 0 || len(ports) == 0 {
+		return result, fmt.Errorf("--allow-remote-checks requires at least one --remote-scope and --remote-ports")
+	}
+	for _, scope := range scopes {
+		ip, network, err := net.ParseCIDR(scope)
+		if err != nil {
+			return result, fmt.Errorf("invalid remote scope %q: %w", scope, err)
+		}
+		if !cidrIsInternal(network) || ip.IsUnspecified() || ip.IsMulticast() {
+			return result, fmt.Errorf("remote scope %s is not an allowed internal network", scope)
+		}
+		result.networks = append(result.networks, network)
+	}
+	for _, port := range ports {
+		if port < 1 || port > 65535 {
+			return result, fmt.Errorf("invalid remote port %d", port)
+		}
+		result.ports[port] = true
+	}
+	return result, nil
+}
+
+func cidrIsInternal(network *net.IPNet) bool {
+	first := network.IP.Mask(network.Mask)
+	last := append(net.IP(nil), first...)
+	for i := range last {
+		last[i] |= ^network.Mask[i]
+	}
+	return policy.IsAllowedInternal(first) && policy.IsAllowedInternal(last)
+}
+
+func (p servicePolicy) authorize(targets []ServiceTarget) error {
+	for _, target := range targets {
+		ip := net.ParseIP(target.Host)
+		if ip == nil {
+			return fmt.Errorf("target %q must be an IP address", target.Host)
+		}
+		if !policy.IsAllowedInternal(ip) || ip.IsUnspecified() || ip.IsMulticast() {
+			return fmt.Errorf("target %s is not an allowed internal address", target.Host)
+		}
+		allowed := false
+		for _, network := range p.networks {
+			if network.Contains(ip) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("target %s is outside the configured remote scopes", target.Host)
+		}
+		if !p.ports[target.Port] {
+			return fmt.Errorf("port %d is outside the configured remote ports", target.Port)
+		}
+	}
+	return nil
 }
 
 type wireMessage struct {
@@ -150,26 +239,42 @@ func Listen(ctx context.Context, opts ListenOptions, out io.Writer) error {
 	if opts.LinkPort <= 0 {
 		opts.LinkPort = DefaultLinkPort
 	}
+	if opts.BindAddress == "" {
+		opts.BindAddress = "0.0.0.0"
+	}
+	bindIP := net.ParseIP(opts.BindAddress)
+	if bindIP == nil || bindIP.To4() == nil {
+		return fmt.Errorf("bind address must be an IPv4 address: %q", opts.BindAddress)
+	}
 
 	peer, err := LocalPeer(opts.Name, opts.DiscoveryPort, opts.LinkPort)
 	if err != nil {
 		return err
 	}
+	remotePolicy, err := newServicePolicy(opts.AllowRemoteChecks, opts.RemoteScopes, opts.RemotePorts)
+	if err != nil {
+		return err
+	}
 
-	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: opts.DiscoveryPort})
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: bindIP, Port: opts.DiscoveryPort})
 	if err != nil {
 		return fmt.Errorf("listen discovery UDP: %w", err)
 	}
 	defer udpConn.Close()
 
-	tcpListener, err := net.Listen("tcp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(opts.LinkPort)))
+	tcpListener, err := net.Listen("tcp4", net.JoinHostPort(opts.BindAddress, strconv.Itoa(opts.LinkPort)))
 	if err != nil {
 		return fmt.Errorf("listen link TCP: %w", err)
 	}
 	defer tcpListener.Close()
 
 	fmt.Fprintf(out, "Net-Link peer listening as %s\n", peer.Name)
-	fmt.Fprintf(out, "Discovery UDP: %d  Link TCP: %d\n", opts.DiscoveryPort, opts.LinkPort)
+	fmt.Fprintf(out, "Discovery UDP: %s:%d  Link TCP: %s:%d\n", opts.BindAddress, opts.DiscoveryPort, opts.BindAddress, opts.LinkPort)
+	if opts.AllowRemoteChecks {
+		fmt.Fprintln(out, "WARNING: unauthenticated remote service checks are ENABLED; use only on networks you control")
+	} else {
+		fmt.Fprintln(out, "Remote service checks are disabled (safe default)")
+	}
 	for _, addr := range peer.Addresses {
 		fmt.Fprintf(out, "  %s\n", addr)
 	}
@@ -182,7 +287,7 @@ func Listen(ctx context.Context, opts ListenOptions, out io.Writer) error {
 	}()
 	go func() {
 		defer wg.Done()
-		serveLinks(ctx, tcpListener, peer, out)
+		serveLinks(ctx, tcpListener, peer, remotePolicy, out)
 	}()
 
 	<-ctx.Done()
@@ -193,13 +298,17 @@ func Listen(ctx context.Context, opts ListenOptions, out io.Writer) error {
 }
 
 func Discover(ctx context.Context, opts DiscoverOptions) ([]Link, error) {
+	return discover(ctx, opts, servicePolicy{})
+}
+
+func discover(ctx context.Context, opts DiscoverOptions, remotePolicy servicePolicy) ([]Link, error) {
 	opts = normalizeDiscoverOptions(opts)
 	peer, err := LocalPeer(opts.Name, opts.DiscoveryPort, opts.LinkPort)
 	if err != nil {
 		return nil, err
 	}
 
-	listener, listenerErr := startTemporaryResponder(ctx, peer)
+	listener, listenerErr := startTemporaryResponder(ctx, peer, remotePolicy)
 	if listenerErr == nil {
 		defer listener.Close()
 	}
@@ -292,7 +401,11 @@ func Matrix(ctx context.Context, opts MatrixOptions) ([]ServiceMatrix, error) {
 		LinkPort:      opts.LinkPort,
 		Timeout:       opts.Timeout,
 	}
-	links, err := Discover(ctx, discoverOpts)
+	remotePolicy, err := newServicePolicy(opts.AllowRemoteChecks, opts.RemoteScopes, opts.RemotePorts)
+	if err != nil {
+		return nil, err
+	}
+	links, err := discover(ctx, discoverOpts, remotePolicy)
 	if err != nil {
 		return nil, err
 	}
@@ -407,14 +520,53 @@ func LocalPeer(name string, discoveryPort int, linkPort int) (Peer, error) {
 		addrs = nil
 	}
 
+	id, publicKey, err := loadOrCreateIdentity()
+	if err != nil {
+		return Peer{}, err
+	}
 	return Peer{
-		ID:            loadOrCreatePeerID(),
+		ID:            id,
 		Name:          name,
 		Version:       model.Version,
 		Addresses:     addrs,
 		DiscoveryPort: discoveryPort,
 		LinkPort:      linkPort,
+		PublicKey:     publicKey,
+		BuildCommit:   model.BuildCommit,
+		BuildDate:     model.BuildDate,
 	}, nil
+}
+
+func loadOrCreateIdentity() (string, string, error) {
+	path := identityKeyPath()
+	if data, err := os.ReadFile(path); err == nil {
+		if raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data))); err == nil && len(raw) == ed25519.PrivateKeySize {
+			privateKey := ed25519.PrivateKey(raw)
+			id, encoded := identityValues(privateKey.Public().(ed25519.PublicKey))
+			return id, encoded, nil
+		}
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", fmt.Errorf("generate peer identity: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return "", "", fmt.Errorf("create identity directory: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(privateKey)+"\n"), 0600); err != nil {
+		return "", "", fmt.Errorf("write peer identity: %w", err)
+	}
+	id, encoded := identityValues(publicKey)
+	return id, encoded, nil
+}
+
+func identityValues(publicKey ed25519.PublicKey) (string, string) {
+	digest := sha256.Sum256(publicKey)
+	return "peer_" + hex.EncodeToString(digest[:16]), base64.StdEncoding.EncodeToString(publicKey)
+}
+
+func identityKeyPath() string {
+	return filepath.Join(filepath.Dir(peerIDPath()), "identity-ed25519")
 }
 
 // loadOrCreatePeerID returns a persistent peer ID from disk, generating and
@@ -457,12 +609,12 @@ func normalizeDiscoverOptions(opts DiscoverOptions) DiscoverOptions {
 	return opts
 }
 
-func startTemporaryResponder(ctx context.Context, peer Peer) (net.Listener, error) {
+func startTemporaryResponder(ctx context.Context, peer Peer, remotePolicy servicePolicy) (net.Listener, error) {
 	listener, err := net.Listen("tcp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(peer.LinkPort)))
 	if err != nil {
 		return nil, fmt.Errorf("reverse listener unavailable: %w", err)
 	}
-	go serveLinks(ctx, listener, peer, io.Discard)
+	go serveLinks(ctx, listener, peer, remotePolicy, io.Discard)
 	return listener, nil
 }
 
@@ -500,7 +652,8 @@ func serveDiscovery(ctx context.Context, conn *net.UDPConn, peer Peer, out io.Wr
 	}
 }
 
-func serveLinks(ctx context.Context, listener net.Listener, peer Peer, out io.Writer) {
+func serveLinks(ctx context.Context, listener net.Listener, peer Peer, remotePolicy servicePolicy, out io.Writer) {
+	clients := make(chan struct{}, maxConcurrentClients)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -509,15 +662,24 @@ func serveLinks(ctx context.Context, listener net.Listener, peer Peer, out io.Wr
 			}
 			continue
 		}
-		go handleLink(conn, peer, out)
+		select {
+		case clients <- struct{}{}:
+			go func() {
+				defer func() { <-clients }()
+				handleLink(conn, peer, remotePolicy, out)
+			}()
+		default:
+			_ = conn.Close()
+			fmt.Fprintln(out, "Rejected link client: concurrent client limit reached")
+		}
 	}
 }
 
-func handleLink(conn net.Conn, peer Peer, out io.Writer) {
+func handleLink(conn net.Conn, peer Peer, remotePolicy servicePolicy, out io.Writer) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	line, err := bufio.NewReader(conn).ReadString('\n')
+	line, err := readWireLine(conn)
 	if err != nil {
 		return
 	}
@@ -554,10 +716,42 @@ func handleLink(conn net.Conn, peer Peer, out io.Writer) {
 		writeWire(conn, wireMessage{Type: helloMessageType, Protocol: protocolVersion, Peer: peer})
 
 	case serviceMessageType:
+		if !remotePolicy.enabled {
+			writeWire(conn, wireMessage{
+				Type:     serviceResultType,
+				Protocol: protocolVersion,
+				Peer:     peer,
+				Error:    "remote service checks are disabled on this peer",
+			})
+			fmt.Fprintf(out, "Rejected service matrix request from %s: remote checks disabled\n", conn.RemoteAddr().String())
+			return
+		}
+		if len(message.Targets) > maxServiceTargets {
+			writeWire(conn, wireMessage{
+				Type:     serviceResultType,
+				Protocol: protocolVersion,
+				Peer:     peer,
+				Error:    fmt.Sprintf("too many service targets: maximum is %d", maxServiceTargets),
+			})
+			return
+		}
+		if err := remotePolicy.authorize(message.Targets); err != nil {
+			writeWire(conn, wireMessage{
+				Type:     serviceResultType,
+				Protocol: protocolVersion,
+				Peer:     peer,
+				Error:    "service check denied by local policy: " + err.Error(),
+			})
+			fmt.Fprintf(out, "Denied service matrix request from %s: %v\n", conn.RemoteAddr().String(), err)
+			return
+		}
 		// Extend the deadline and create a matching context so the spawned
 		// goroutines in checkServices are cancelled when the work is done
 		// rather than running indefinitely on context.Background().
 		svcTimeout := 2*time.Second + time.Duration(len(message.Targets))*250*time.Millisecond
+		if svcTimeout > maxServiceDuration {
+			svcTimeout = maxServiceDuration
+		}
 		_ = conn.SetDeadline(time.Now().Add(svcTimeout))
 		ctx, cancel := context.WithTimeout(context.Background(), svcTimeout)
 		defer cancel()
@@ -655,22 +849,37 @@ func requestPeerServiceCheck(ctx context.Context, address string, port int, loca
 	if response.Type != serviceResultType || response.Protocol != protocolVersion {
 		return nil, fmt.Errorf("unexpected service response")
 	}
+	if response.Error != "" {
+		return nil, fmt.Errorf("peer rejected service check: %s", response.Error)
+	}
 	return response.Results, nil
 }
 
 func checkServices(ctx context.Context, source string, targets []ServiceTarget, timeout time.Duration, direction string) []ServiceResult {
 	results := make([]ServiceResult, len(targets))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 64)
-	for i, target := range targets {
-		wg.Add(1)
-		go func(i int, target ServiceTarget) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			results[i] = checkService(ctx, source, target, timeout, direction)
-		}(i, target)
+	type work struct {
+		index  int
+		target ServiceTarget
 	}
+	workCh := make(chan work)
+	workers := maxServiceWorkers
+	if len(targets) < workers {
+		workers = len(targets)
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range workCh {
+				results[item.index] = checkService(ctx, source, item.target, timeout, direction)
+			}
+		}()
+	}
+	for i, target := range targets {
+		workCh <- work{index: i, target: target}
+	}
+	close(workCh)
 	wg.Wait()
 	return results
 }
@@ -711,11 +920,19 @@ func writeWire(w io.Writer, message wireMessage) error {
 }
 
 func readWire(r io.Reader, message *wireMessage) error {
-	line, err := bufio.NewReader(r).ReadString('\n')
+	line, err := readWireLine(r)
 	if err != nil {
 		return err
 	}
 	return json.Unmarshal([]byte(strings.TrimSpace(line)), message)
+}
+
+func readWireLine(r io.Reader) (string, error) {
+	line, err := bufio.NewReader(io.LimitReader(r, maxWireMessageBytes+1)).ReadString('\n')
+	if len(line) > maxWireMessageBytes {
+		return "", fmt.Errorf("wire message exceeds %d bytes", maxWireMessageBytes)
+	}
+	return line, err
 }
 
 func broadcastAddresses(port int) []*net.UDPAddr {
@@ -752,7 +969,7 @@ func broadcastAddresses(port int) []*net.UDPAddr {
 			}
 			ip := ipNet.IP.To4()
 			mask := net.IP(ipNet.Mask).To4()
-			if ip == nil || mask == nil || !ip.IsPrivate() {
+			if ip == nil || mask == nil || !policy.IsAllowedInternal(ip) {
 				continue
 			}
 			add(net.IPv4(ip[0]|^mask[0], ip[1]|^mask[1], ip[2]|^mask[2], ip[3]|^mask[3]))
@@ -782,7 +999,7 @@ func localPrivateIPv4Addresses() ([]string, error) {
 				continue
 			}
 			ip := ipNet.IP.To4()
-			if ip == nil || !ip.IsPrivate() {
+			if ip == nil || !policy.IsAllowedInternal(ip) {
 				continue
 			}
 			out = append(out, ip.String())

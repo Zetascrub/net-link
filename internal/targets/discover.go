@@ -1,14 +1,24 @@
 package targets
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/Zetascrub/net-link/internal/model"
 	"github.com/Zetascrub/net-link/internal/policy"
 )
+
+type AutoNetworkOptions struct {
+	IncludeInterfaces []string
+	ExcludeInterfaces []string
+	ExcludeVirtual    bool
+	IncludeRoutes     bool
+}
 
 func FromCIDR(cidr string, ports []int, maxHosts int, allowPublic bool) ([]model.Target, error) {
 	if maxHosts <= 0 {
@@ -67,7 +77,40 @@ func FromLocalNetworks(ports []int, maxHosts int) ([]model.Target, []string, err
 	return out, networks, nil
 }
 
+func FromNetworks(networks []string, ports []int, maxHosts, maxTotalHosts int) ([]model.Target, error) {
+	if maxTotalHosts <= 0 {
+		return nil, fmt.Errorf("max total hosts must be greater than zero")
+	}
+	seenHosts := map[string]bool{}
+	seenTargets := map[string]bool{}
+	var out []model.Target
+	for _, network := range networks {
+		generated, err := FromCIDR(network, ports, maxHosts, false)
+		if err != nil {
+			return nil, err
+		}
+		for _, target := range generated {
+			if !seenHosts[target.Host] {
+				if len(seenHosts) >= maxTotalHosts {
+					return nil, fmt.Errorf("automatic scope exceeds --max-total-hosts=%d", maxTotalHosts)
+				}
+				seenHosts[target.Host] = true
+			}
+			key := fmt.Sprintf("%s:%d/%s", target.Host, target.Port, target.Protocol)
+			if !seenTargets[key] {
+				seenTargets[key] = true
+				out = append(out, target)
+			}
+		}
+	}
+	return out, nil
+}
+
 func LocalPrivateIPv4Networks() ([]string, error) {
+	return AutoPrivateIPv4Networks(AutoNetworkOptions{})
+}
+
+func AutoPrivateIPv4Networks(opts AutoNetworkOptions) ([]string, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
@@ -77,6 +120,9 @@ func LocalPrivateIPv4Networks() ([]string, error) {
 	var networks []string
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if !interfaceSelected(iface.Name, opts) {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -89,7 +135,7 @@ func LocalPrivateIPv4Networks() ([]string, error) {
 				continue
 			}
 			ip := ipNet.IP.To4()
-			if ip == nil || !ip.IsPrivate() {
+			if ip == nil || !policy.IsAllowedInternal(ip) {
 				continue
 			}
 			network := &net.IPNet{IP: ip.Mask(ipNet.Mask), Mask: ipNet.Mask}
@@ -100,7 +146,95 @@ func LocalPrivateIPv4Networks() ([]string, error) {
 			}
 		}
 	}
+	if opts.IncludeRoutes {
+		routes, err := privateIPv4Routes("/proc/net/route", opts)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+		for _, route := range routes {
+			if !seen[route] {
+				seen[route] = true
+				networks = append(networks, route)
+			}
+		}
+	}
 	return networks, nil
+}
+
+func interfaceSelected(name string, opts AutoNetworkOptions) bool {
+	if len(opts.IncludeInterfaces) > 0 && !containsString(opts.IncludeInterfaces, name) {
+		return false
+	}
+	if containsString(opts.ExcludeInterfaces, name) {
+		return false
+	}
+	if opts.ExcludeVirtual && len(opts.IncludeInterfaces) == 0 {
+		lower := strings.ToLower(name)
+		for _, prefix := range []string{"docker", "br-", "veth", "cni", "flannel", "podman", "virbr", "tun", "tap", "wg", "zt"} {
+			if strings.HasPrefix(lower, prefix) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func containsString(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func privateIPv4Routes(path string, opts AutoNetworkOptions) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	seen := map[string]bool{}
+	var routes []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 8 || fields[0] == "Iface" || !interfaceSelected(fields[0], opts) {
+			continue
+		}
+		flags, err := strconv.ParseUint(fields[3], 16, 32)
+		if err != nil || flags&1 == 0 || fields[1] == "00000000" {
+			continue
+		}
+		destination, err1 := routeHexIPv4(fields[1])
+		maskIP, err2 := routeHexIPv4(fields[7])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		mask := net.IPMask(maskIP.To4())
+		network := &net.IPNet{IP: destination.Mask(mask), Mask: mask}
+		if !policy.IsAllowedInternal(destination) {
+			continue
+		}
+		value := network.String()
+		if !seen[value] {
+			seen[value] = true
+			routes = append(routes, value)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return routes, nil
+}
+
+func routeHexIPv4(value string) (net.IP, error) {
+	n, err := strconv.ParseUint(value, 16, 32)
+	if err != nil {
+		return nil, err
+	}
+	return net.IPv4(byte(n), byte(n>>8), byte(n>>16), byte(n>>24)), nil
 }
 
 func expandIPv4CIDR(cidr string, maxHosts int) ([]string, error) {
