@@ -332,8 +332,16 @@ func discover(ctx context.Context, opts DiscoverOptions, remotePolicy servicePol
 		_, _ = conn.WriteToUDP(message, addr)
 	}
 
+	// Collect every hello that arrives within the discovery window first, then
+	// verify peers concurrently. Verifying inline here would burn the shared
+	// read deadline on each peer's TCP handshake and drop hellos from any peer
+	// that answers while an earlier verify is still in flight.
+	type candidate struct {
+		peer    Peer
+		address string
+	}
 	_ = conn.SetReadDeadline(time.Now().Add(opts.Timeout))
-	seen := map[string]Link{}
+	candidates := map[string]candidate{}
 	buffer := make([]byte, 8192)
 	for {
 		n, remote, err := conn.ReadFromUDP(buffer)
@@ -357,26 +365,39 @@ func discover(ctx context.Context, opts DiscoverOptions, remotePolicy servicePol
 
 		address := remote.IP.String()
 		key := response.Peer.ID + "@" + address
-		if _, ok := seen[key]; ok {
+		if _, ok := candidates[key]; ok {
 			continue
 		}
-
-		linked, dur, linkErr, reverseLinked, reverseErr := verifyLink(ctx, peer, address, response.Peer.LinkPort, opts.Timeout)
-		item := Link{
-			Peer:          response.Peer,
-			Address:       address,
-			Discovered:    time.Now().UTC(),
-			Linked:        linked,
-			Duration:      model.Duration(dur),
-			Error:         linkErr,
-			ReverseLinked: reverseLinked,
-			ReverseError:  reverseErr,
-		}
-		if listenerErr != nil && item.ReverseError == "" {
-			item.ReverseError = listenerErr.Error()
-		}
-		seen[key] = item
+		candidates[key] = candidate{peer: response.Peer, address: address}
 	}
+
+	seen := make(map[string]Link, len(candidates))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for key, cand := range candidates {
+		wg.Add(1)
+		go func(key string, cand candidate) {
+			defer wg.Done()
+			linked, dur, linkErr, reverseLinked, reverseErr := verifyLink(ctx, peer, cand.address, cand.peer.LinkPort, opts.Timeout)
+			item := Link{
+				Peer:          cand.peer,
+				Address:       cand.address,
+				Discovered:    time.Now().UTC(),
+				Linked:        linked,
+				Duration:      model.Duration(dur),
+				Error:         linkErr,
+				ReverseLinked: reverseLinked,
+				ReverseError:  reverseErr,
+			}
+			if listenerErr != nil && item.ReverseError == "" {
+				item.ReverseError = listenerErr.Error()
+			}
+			mu.Lock()
+			seen[key] = item
+			mu.Unlock()
+		}(key, cand)
+	}
+	wg.Wait()
 
 	links := make([]Link, 0, len(seen))
 	for _, link := range seen {
@@ -569,22 +590,8 @@ func identityKeyPath() string {
 	return filepath.Join(filepath.Dir(peerIDPath()), "identity-ed25519")
 }
 
-// loadOrCreatePeerID returns a persistent peer ID from disk, generating and
-// saving one on first use. This keeps the ID stable across DHCP address changes
-// and reboots, unlike a hash of hostname+IPs.
-func loadOrCreatePeerID() string {
-	path := peerIDPath()
-	if data, err := os.ReadFile(path); err == nil {
-		if id := strings.TrimSpace(string(data)); id != "" {
-			return id
-		}
-	}
-	id := ids.New("peer")
-	_ = os.MkdirAll(filepath.Dir(path), 0700)
-	_ = os.WriteFile(path, []byte(id+"\n"), 0600)
-	return id
-}
-
+// peerIDPath returns the config path whose directory also holds the persistent
+// Ed25519 identity key (see identityKeyPath / loadOrCreateIdentity).
 func peerIDPath() string {
 	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
 		return filepath.Join(dir, "net-link", "peer-id")

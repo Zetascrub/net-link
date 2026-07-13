@@ -360,7 +360,7 @@ func runDiscover(ctx context.Context, args []string) int {
 		Concurrency: *concurrency,
 	}, targetList)
 	printSummary(run)
-	printReachable(os.Stdout, run)
+	printReachable(os.Stderr, run)
 	if err := writeRunOutput(*out, *jsonOut, run); err != nil {
 		return fail(err)
 	}
@@ -439,7 +439,7 @@ func runTest(ctx context.Context, args []string) int {
 		Concurrency: *concurrency,
 	}, targetList)
 	printSummary(run)
-	printReachable(os.Stdout, run)
+	printReachable(os.Stderr, run)
 	if err := writeRunOutput(*out, *jsonOut, run); err != nil {
 		return fail(err)
 	}
@@ -509,7 +509,7 @@ func runScan(ctx context.Context, args []string) int {
 		Concurrency: *concurrency,
 	}, targetList)
 	printSummary(run)
-	printReachable(os.Stdout, run)
+	printReachable(os.Stderr, run)
 	if err := writeRunOutput(*out, *jsonOut, run); err != nil {
 		return fail(err)
 	}
@@ -656,11 +656,11 @@ Usage:
 
 func printLinks(links []link.Link) {
 	if len(links) == 0 {
-		fmt.Println("No Net-Link peers found.")
+		fmt.Fprintln(os.Stderr, "No Net-Link peers found.")
 		return
 	}
 
-	fmt.Printf("Net-Link peers: %d\n", len(links))
+	fmt.Fprintf(os.Stderr, "Net-Link peers: %d\n", len(links))
 	for _, item := range links {
 		state := "failed"
 		if item.Linked && item.ReverseLinked {
@@ -669,7 +669,7 @@ func printLinks(links []link.Link) {
 			state = "linked_one_way"
 		}
 
-		fmt.Printf("  %s at %s:%d  %s  %s\n",
+		fmt.Fprintf(os.Stderr, "  %s at %s:%d  %s  %s\n",
 			item.Peer.Name,
 			item.Address,
 			item.Peer.LinkPort,
@@ -677,27 +677,27 @@ func printLinks(links []link.Link) {
 			item.Duration.String(),
 		)
 		if len(item.Peer.Addresses) > 0 {
-			fmt.Printf("    addresses: %s\n", strings.Join(item.Peer.Addresses, ", "))
+			fmt.Fprintf(os.Stderr, "    addresses: %s\n", strings.Join(item.Peer.Addresses, ", "))
 		}
 		if item.Error != "" {
-			fmt.Printf("    error: %s\n", item.Error)
+			fmt.Fprintf(os.Stderr, "    error: %s\n", item.Error)
 		}
 		if item.ReverseError != "" {
-			fmt.Printf("    reverse: %s\n", item.ReverseError)
+			fmt.Fprintf(os.Stderr, "    reverse: %s\n", item.ReverseError)
 		}
 	}
 }
 
 func printMatrices(matrices []link.ServiceMatrix) {
 	if len(matrices) == 0 {
-		fmt.Println("No Net-Link peers found.")
+		fmt.Fprintln(os.Stderr, "No Net-Link peers found.")
 		return
 	}
 
 	for _, matrix := range matrices {
-		fmt.Printf("Peer: %s\n", matrix.Peer.Name)
+		fmt.Fprintf(os.Stderr, "Peer: %s\n", matrix.Peer.Name)
 		if matrix.RequestError != "" {
-			fmt.Printf("  warning: %s\n", matrix.RequestError)
+			fmt.Fprintf(os.Stderr, "  warning: %s\n", matrix.RequestError)
 		}
 		printServiceResults("  local -> peer", matrix.LocalToPeer)
 		printServiceResults("  peer  -> local", matrix.PeerToLocal)
@@ -711,9 +711,9 @@ func printServiceResults(label string, results []link.ServiceResult) {
 			grouped[result.Target.Host] = append(grouped[result.Target.Host], result.Target.Port)
 		}
 	}
-	fmt.Println(label)
+	fmt.Fprintln(os.Stderr, label)
 	if len(grouped) == 0 {
-		fmt.Println("    no reachable services")
+		fmt.Fprintln(os.Stderr, "    no reachable services")
 		return
 	}
 	hosts := make([]string, 0, len(grouped))
@@ -722,7 +722,7 @@ func printServiceResults(label string, results []link.ServiceResult) {
 	}
 	sort.Strings(hosts)
 	for _, host := range hosts {
-		fmt.Printf("    %-15s %s\n", host, joinInts(uniqueSortedInts(grouped[host])))
+		fmt.Fprintf(os.Stderr, "    %-15s %s\n", host, joinInts(uniqueSortedInts(grouped[host])))
 	}
 }
 
