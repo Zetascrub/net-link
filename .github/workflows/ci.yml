@@ -51,7 +51,7 @@ jobs:
           go-version-input: 1.26.x
           go-package: ./...
       - name: Upload coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage/coverage.out
@@ -75,7 +75,7 @@ jobs:
       - name: Verify checksums
         run: cd dist && sha256sum -c SHA256SUMS
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: net-link-${{ github.sha }}
           path: dist/
